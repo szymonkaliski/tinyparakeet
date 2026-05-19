@@ -20,6 +20,10 @@
       {
         devShells.default = pkgs.mkShell {
           packages = [ pkgs.swift-format ];
+
+          shellHook = ''
+            unset SDKROOT DEVELOPER_DIR
+          '';
         };
       }
     );
