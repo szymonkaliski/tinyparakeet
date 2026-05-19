@@ -1,6 +1,6 @@
 # `tinyparakeet`
 
-![demo](demo.gif)
+![Demo](assets/demo.gif)
 
 Tiny CLI dictation for macOS. Records from the system default mic, streams transcription with NVIDIA Parakeet (CoreML on the Neural Engine via [FluidAudio](https://github.com/FluidInference/FluidAudio)) so text appears as you speak, and copies the final to the clipboard.
 
