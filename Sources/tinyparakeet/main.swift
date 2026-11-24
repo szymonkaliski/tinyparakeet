@@ -1,7 +1,8 @@
 import AVFoundation
 import AppKit
 import ArgumentParser
-import CoreAudio
+import CoreMedia
+import Darwin
 import Dispatch
 import FluidAudio
 import Foundation
@@ -28,11 +29,14 @@ struct Tinyparakeet: AsyncParsableCommand {
 
   mutating func run() async throws {
     if listDevices {
+      let defaultID = AVCaptureDevice.default(for: .audio)?.uniqueID
       for d in InputDevices.all() {
-        print("\(d.name)\(d.isDefault ? "  (default)" : "")")
+        print("\(d.localizedName)\(d.uniqueID == defaultID ? "  (default)" : "")")
       }
       return
     }
+
+    try await ensureMicrophonePermission()
 
     Log.info("loading model...")
     let manager = StreamingModelVariant.parakeetEou160ms.createManager()
@@ -57,107 +61,395 @@ struct Tinyparakeet: AsyncParsableCommand {
   }
 }
 
+func ensureMicrophonePermission() async throws {
+  guard await AVCaptureDevice.requestAccess(for: .audio) else {
+    throw ValidationError(
+      "microphone permission denied - enable your terminal/launcher in System Settings > Privacy & Security > Microphone"
+    )
+  }
+}
+
+final class AudioInputCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate,
+  @unchecked Sendable
+{
+  struct Stats {
+    var dropped = 0
+    var copyErrors = 0
+    var lastCopyError: OSStatus = noErr
+    var runtimeError: String?
+  }
+
+  private let session = AVCaptureSession()
+  private let queue = DispatchQueue(label: "tinyparakeet.capture", qos: .userInteractive)
+  private let continuation: AsyncStream<AVAudioPCMBuffer>.Continuation
+  private let stats = OSAllocatedUnfairLock(initialState: Stats())
+  private var cachedFormat: (desc: CMFormatDescription, format: AVAudioFormat)?
+  private var errorObserver: NSObjectProtocol?
+
+  init(
+    device: AVCaptureDevice,
+    continuation: AsyncStream<AVAudioPCMBuffer>.Continuation
+  ) throws {
+    self.continuation = continuation
+    super.init()
+
+    let input = try AVCaptureDeviceInput(device: device)
+    guard session.canAddInput(input) else {
+      throw ValidationError("cannot attach input device \"\(device.localizedName)\"")
+    }
+    session.addInput(input)
+
+    let output = AVCaptureAudioDataOutput()
+    output.setSampleBufferDelegate(self, queue: queue)
+    guard session.canAddOutput(output) else {
+      throw ValidationError("cannot attach audio capture output")
+    }
+    session.addOutput(output)
+
+    errorObserver = NotificationCenter.default.addObserver(
+      forName: AVCaptureSession.runtimeErrorNotification,
+      object: session,
+      queue: nil
+    ) { [weak self] note in
+      let message =
+        (note.userInfo?[AVCaptureSessionErrorKey] as? NSError)?.localizedDescription
+        ?? "unknown capture session error"
+      self?.stats.withLock { $0.runtimeError = message }
+    }
+  }
+
+  deinit {
+    stop()
+    if let errorObserver {
+      NotificationCenter.default.removeObserver(errorObserver)
+    }
+  }
+
+  func start() {
+    session.startRunning()
+  }
+
+  func stop() {
+    if session.isRunning {
+      session.stopRunning()
+    }
+    queue.sync {}
+  }
+
+  func captureStats() -> Stats {
+    stats.withLock { $0 }
+  }
+
+  func captureOutput(
+    _ output: AVCaptureOutput,
+    didOutput sampleBuffer: CMSampleBuffer,
+    from connection: AVCaptureConnection
+  ) {
+    guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer) else { return }
+    let frameCount = AVAudioFrameCount(CMSampleBufferGetNumSamples(sampleBuffer))
+    guard frameCount > 0 else { return }
+
+    guard let format = resolvedFormat(for: formatDesc) else {
+      stats.withLock { $0.dropped += 1 }
+      return
+    }
+    guard let pcm = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else {
+      stats.withLock { $0.dropped += 1 }
+      return
+    }
+    pcm.frameLength = frameCount
+
+    let status = CMSampleBufferCopyPCMDataIntoAudioBufferList(
+      sampleBuffer,
+      at: 0,
+      frameCount: Int32(frameCount),
+      into: pcm.mutableAudioBufferList
+    )
+    guard status == noErr else {
+      stats.withLock {
+        $0.copyErrors += 1
+        $0.lastCopyError = status
+      }
+      return
+    }
+    continuation.yield(pcm)
+  }
+
+  private func resolvedFormat(for formatDesc: CMFormatDescription) -> AVAudioFormat? {
+    if let cached = cachedFormat, cached.desc == formatDesc {
+      return cached.format
+    }
+    guard let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) else {
+      return nil
+    }
+    let channels = asbdPtr.pointee.mChannelsPerFrame
+    let format: AVAudioFormat?
+    if channels > 2 {
+      let layout =
+        CMAudioFormatDescriptionGetChannelLayout(formatDesc, sizeOut: nil).map {
+          AVAudioChannelLayout(layout: $0)
+        }
+        ?? AVAudioChannelLayout(layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | channels)
+      format = layout.flatMap { AVAudioFormat(streamDescription: asbdPtr, channelLayout: $0) }
+    } else {
+      format = AVAudioFormat(streamDescription: asbdPtr)
+    }
+    cachedFormat = format.map { (formatDesc, $0) }
+    return format
+  }
+}
+
+/// Stateful converter to 16 kHz mono Float32 non-interleaved so FluidAudio hits
+/// its fast path without resetting a Mastering FIR filter on every capture slice.
+final class StreamingResampler {
+  private static let targetFormat = AVAudioFormat(
+    commonFormat: .pcmFormatFloat32,
+    sampleRate: 16_000,
+    channels: 1,
+    interleaved: false
+  )!
+
+  private enum Mode {
+    case passthrough
+    case convert(AVAudioConverter)
+  }
+
+  private var state: (format: AVAudioFormat, mode: Mode)?
+
+  func process(_ buffer: AVAudioPCMBuffer) throws -> [AVAudioPCMBuffer] {
+    var outputs: [AVAudioPCMBuffer] = []
+    if let current = state, current.format != buffer.format {
+      outputs.append(contentsOf: try flush())
+      state = nil
+    }
+    let mode: Mode
+    if let current = state {
+      mode = current.mode
+    } else {
+      let created = try makeMode(for: buffer.format)
+      state = (buffer.format, created)
+      mode = created
+    }
+
+    switch mode {
+    case .passthrough:
+      outputs.append(buffer)
+    case .convert(let converter):
+      if let out = try convertStreaming(buffer, using: converter) {
+        outputs.append(out)
+      }
+    }
+    return outputs
+  }
+
+  func flush() throws -> [AVAudioPCMBuffer] {
+    guard case .convert(let converter) = state?.mode else { return [] }
+    var buffers: [AVAudioPCMBuffer] = []
+    while let out = AVAudioPCMBuffer(pcmFormat: converter.outputFormat, frameCapacity: 4096) {
+      var err: NSError?
+      let status = converter.convert(to: out, error: &err) { _, outStatus in
+        outStatus.pointee = .endOfStream
+        return nil
+      }
+      if status == .error {
+        throw err ?? ValidationError("audio conversion failed")
+      }
+      if out.frameLength > 0 { buffers.append(out) }
+      if status != .haveData { break }
+    }
+    return buffers
+  }
+
+  private func makeMode(for format: AVAudioFormat) throws -> Mode {
+    if format == Self.targetFormat {
+      return .passthrough
+    }
+    guard let converter = AVAudioConverter(from: format, to: Self.targetFormat) else {
+      throw ValidationError(
+        "failed to create audio converter from \(format) to \(Self.targetFormat)")
+    }
+    if format.channelCount == 2 && converter.channelMap != [-1] {
+      converter.downmix = true
+    } else if format.channelCount > 1 {
+      converter.channelMap = [0]
+    }
+    converter.sampleRateConverterAlgorithm = AVSampleRateConverterAlgorithm_Mastering
+    converter.sampleRateConverterQuality = AVAudioQuality.max.rawValue
+    return .convert(converter)
+  }
+
+  private func convertStreaming(
+    _ input: AVAudioPCMBuffer,
+    using converter: AVAudioConverter
+  ) throws -> AVAudioPCMBuffer? {
+    let ratio = converter.outputFormat.sampleRate / input.format.sampleRate
+    let capacity = AVAudioFrameCount((Double(input.frameLength) * ratio).rounded(.up)) + 32
+    guard let out = AVAudioPCMBuffer(pcmFormat: converter.outputFormat, frameCapacity: capacity)
+    else { return nil }
+    var fed = false
+    var err: NSError?
+    let status = converter.convert(to: out, error: &err) { _, outStatus in
+      if !fed {
+        fed = true
+        outStatus.pointee = .haveData
+        return input
+      }
+      outStatus.pointee = .noDataNow
+      return nil
+    }
+    if status == .error {
+      throw err ?? ValidationError("audio conversion failed")
+    }
+    return out.frameLength > 0 ? out : nil
+  }
+}
+
 func streamAndTranscribe(manager: any StreamingAsrManager, deviceQuery: String?) async throws
   -> String
 {
-  let engine = AVAudioEngine()
-  let input = engine.inputNode
-
+  let selected: AVCaptureDevice
   if let q = deviceQuery {
     guard let match = InputDevices.find(matching: q) else {
       throw ValidationError("no input device matches \"\(q)\"")
     }
-    try InputDevices.set(deviceID: match.id, on: input)
-    Log.info("input: \(match.name)")
-  } else if let def = InputDevices.defaultDevice() {
-    Log.info("input: \(def.name)  (default)")
+    selected = match
+    Log.info("input: \(selected.localizedName)")
+  } else {
+    guard let def = AVCaptureDevice.default(for: .audio) else {
+      throw ValidationError("no default input device available")
+    }
+    selected = def
+    Log.info("input: \(selected.localizedName)  (default)")
   }
 
-  let format = input.outputFormat(forBus: 0)
-  guard format.commonFormat == .pcmFormatFloat32, !format.isInterleaved else {
-    throw ValidationError("unexpected input format: \(format)")
-  }
-
-  // Unbounded buffering: realtime audio must never block. Drain is awaited per-buffer,
-  // so if the model falls behind memory grows until the user stops the session. Fine
-  // for a CLI that runs until Enter/Ctrl-C.
+  // Unbounded buffering: capture callbacks must never block. Drain is awaited
+  // per buffer, so if the model falls behind memory grows until stop.
   let (stream, continuation) = AsyncStream.makeStream(
     of: AVAudioPCMBuffer.self,
     bufferingPolicy: .unbounded
   )
 
-  let dropped = OSAllocatedUnfairLock(initialState: 0)
-
-  input.installTap(onBus: 0, bufferSize: 4096, format: format) { buf, _ in
-    guard let copy = AVAudioPCMBuffer(pcmFormat: buf.format, frameCapacity: buf.frameLength) else {
-      dropped.withLock { $0 += 1 }
-      return
-    }
-    copy.frameLength = buf.frameLength
-    let channels = Int(buf.format.channelCount)
-    if let src = buf.floatChannelData, let dst = copy.floatChannelData {
-      for c in 0..<channels {
-        memcpy(dst[c], src[c], Int(buf.frameLength) * MemoryLayout<Float>.size)
-      }
-    }
-    continuation.yield(copy)
-  }
-
-  try engine.start()
+  let capture = try AudioInputCapture(device: selected, continuation: continuation)
+  let resampler = StreamingResampler()
+  capture.start()
   Log.info("recording - press Enter or Ctrl-C to stop")
 
+  let stopWaiter = Task { await StopSignal.wait() }
   let drainTask: Task<Void, Error> = Task {
-    for await buf in stream {
-      try await manager.appendAudio(buf)
-      try await manager.processBufferedAudio()
+    func feed(_ chunks: [AVAudioPCMBuffer]) async throws {
+      for chunk in chunks {
+        try await manager.appendAudio(chunk)
+        try await manager.processBufferedAudio()
+      }
+    }
+    do {
+      for await buf in stream {
+        try await feed(try resampler.process(buf))
+      }
+      try await feed(try resampler.flush())
+    } catch {
+      stopWaiter.cancel()
+      throw error
     }
   }
 
-  await StopSignal.wait()
+  defer {
+    stopWaiter.cancel()
+    capture.stop()
+    continuation.finish()
+  }
 
-  engine.stop()
-  input.removeTap(onBus: 0)
+  await stopWaiter.value
+  capture.stop()
   continuation.finish()
   try await drainTask.value
 
-  let drops = dropped.withLock { $0 }
-  if drops > 0 {
-    Log.info("warning: dropped \(drops) audio buffer(s) under memory pressure")
+  let stats = capture.captureStats()
+  if stats.dropped > 0 {
+    Log.info("warning: dropped \(stats.dropped) audio buffer(s)")
+  }
+  if stats.copyErrors > 0 {
+    Log.info(
+      "warning: \(stats.copyErrors) audio copy error(s) (last status \(stats.lastCopyError))"
+    )
+  }
+  if let runtimeError = stats.runtimeError {
+    Log.info("warning: capture session error: \(runtimeError)")
   }
 
   return try await manager.finish()
 }
 
-/// Wait for either Enter on stdin or SIGINT. Whichever fires first resolves.
-/// SIGINT default handling is restored on exit so callers downstream still die on Ctrl-C.
+/// Wait for either Return on stdin or SIGINT, suppressing tty echo (`ECHO`,
+/// `ECHONL`, `ECHOCTL`) while waiting so neither Return nor Ctrl-C shifts the
+/// cursor off the live partial line. Restores both termios and SIGINT on exit.
 enum StopSignal {
+  private enum State {
+    case pending
+    case waiting(CheckedContinuation<Void, Never>)
+    case done
+  }
+
   static func wait() async {
+    var savedTermios = termios()
+    let restoreTermios = isatty(STDIN_FILENO) != 0 && tcgetattr(STDIN_FILENO, &savedTermios) == 0
+    if restoreTermios {
+      var quiet = savedTermios
+      quiet.c_lflag &= ~tcflag_t(ECHO | ECHONL | ECHOCTL)
+      tcsetattr(STDIN_FILENO, TCSANOW, &quiet)
+    }
+
     // SIG_IGN suppresses the default action so the DispatchSource handler can fire.
     signal(SIGINT, SIG_IGN)
     let src = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
+    let state = OSAllocatedUnfairLock(initialState: State.pending)
+    let resumeOnce: @Sendable () -> Void = {
+      let cont = state.withLock { current -> CheckedContinuation<Void, Never>? in
+        switch current {
+        case .pending:
+          current = .done
+          return nil
+        case .waiting(let c):
+          current = .done
+          return c
+        case .done:
+          return nil
+        }
+      }
+      cont?.resume()
+    }
+    src.setEventHandler { resumeOnce() }
+    src.resume()
     defer {
       src.cancel()
       signal(SIGINT, SIG_DFL)
+      if restoreTermios {
+        tcsetattr(STDIN_FILENO, TCSANOW, &savedTermios)
+      }
     }
 
-    await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-      let resolved = OSAllocatedUnfairLock(initialState: false)
-      let resumeOnce: @Sendable () -> Void = {
-        let should = resolved.withLock { state -> Bool in
-          guard !state else { return false }
-          state = true
-          return true
+    await withTaskCancellationHandler {
+      await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+        let immediate = state.withLock { current -> Bool in
+          switch current {
+          case .pending:
+            current = .waiting(cont)
+            return false
+          case .waiting, .done:
+            return true
+          }
         }
-        if should { cont.resume() }
+        if immediate {
+          cont.resume()
+        } else {
+          Task.detached {
+            _ = readLine()
+            resumeOnce()
+          }
+        }
       }
-
-      src.setEventHandler { resumeOnce() }
-      src.resume()
-
-      Task.detached {
-        _ = readLine()
-        resumeOnce()
-      }
+    } onCancel: {
+      resumeOnce()
     }
   }
 }
@@ -183,7 +475,6 @@ enum Log {
     static let reset = "\u{1B}[0m"
     static let dim = "\u{1B}[2m"
     static let clearLine = "\u{1B}[2K"
-    static let cursorUp = "\u{1B}[A"
   }
 
   static func info(_ s: String) {
@@ -198,6 +489,11 @@ enum Log {
     }
   }
 
+  /// Live transcript preview. On a tty the partial is redrawn in place on a
+  /// single line: carriage-return to column 0, clear the line, write the tail
+  /// that fits. Staying on one line is the whole trick - `\r` + clear-line is
+  /// the one redraw every terminal does identically, so there's no cursor math
+  /// to get wrong across wrapping, scrolling, or resize.
   static func partial(_ s: String) {
     let text = s.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !text.isEmpty else { return }
@@ -215,15 +511,8 @@ enum Log {
   /// If stdout is piped, also emit the final to stdout.
   static func show(final: String, alsoEmitToStdout: Bool) {
     write {
-      if stderrTty {
-        if partialActive {
-          // After readLine, the cursor sits one row below the partial; step back up.
-          writeRaw("\(Ansi.cursorUp)\r\(Ansi.clearLine)\(final)\n")
-          partialActive = false
-        } else if !final.isEmpty {
-          writeRaw(final + "\n")
-        }
-      } else if !final.isEmpty {
+      dropPartial()
+      if !final.isEmpty {
         writeRaw(final + "\n")
       }
     }
@@ -246,9 +535,9 @@ enum Log {
   }
 
   private static func clip(_ s: String) -> String {
-    let max = currentCols() - 1
-    if s.count <= max { return s }
-    return String(s.suffix(max))
+    let maxLen = currentCols() - 1
+    if s.count <= maxLen { return s }
+    return String(s.suffix(maxLen))
   }
 
   private static func writeRaw(_ s: String) {
@@ -256,106 +545,16 @@ enum Log {
   }
 }
 
-struct InputDevice {
-  let id: AudioDeviceID
-  let name: String
-  let isDefault: Bool
-}
-
 enum InputDevices {
-  static func all() -> [InputDevice] {
-    let defID = defaultDeviceID()
-    var addr = AudioObjectPropertyAddress(
-      mSelector: kAudioHardwarePropertyDevices,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    var size: UInt32 = 0
-    guard
-      AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size)
-        == noErr
-    else {
-      return []
-    }
-    let count = Int(size) / MemoryLayout<AudioDeviceID>.size
-    var ids = [AudioDeviceID](repeating: 0, count: count)
-    guard
-      AudioObjectGetPropertyData(
-        AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &ids) == noErr
-    else {
-      return []
-    }
-    return ids.compactMap { id -> InputDevice? in
-      guard hasInputStreams(id) else { return nil }
-      guard let name = name(of: id) else { return nil }
-      return InputDevice(id: id, name: name, isDefault: id == defID)
-    }
+  static func all() -> [AVCaptureDevice] {
+    AVCaptureDevice.DiscoverySession(
+      deviceTypes: [.microphone, .external],
+      mediaType: .audio,
+      position: .unspecified
+    ).devices
   }
 
-  static func defaultDevice() -> InputDevice? {
-    let id = defaultDeviceID()
-    guard id != 0, let name = name(of: id) else { return nil }
-    return InputDevice(id: id, name: name, isDefault: true)
-  }
-
-  static func find(matching query: String) -> InputDevice? {
-    let q = query.lowercased()
-    return all().first { $0.name.lowercased().contains(q) }
-  }
-
-  static func set(deviceID: AudioDeviceID, on input: AVAudioInputNode) throws {
-    guard let unit = input.audioUnit else {
-      throw ValidationError("input has no audio unit")
-    }
-    var id = deviceID
-    let status = AudioUnitSetProperty(
-      unit,
-      kAudioOutputUnitProperty_CurrentDevice,
-      kAudioUnitScope_Global,
-      0,
-      &id,
-      UInt32(MemoryLayout<AudioDeviceID>.size)
-    )
-    guard status == noErr else {
-      throw ValidationError("failed to set input device (status \(status))")
-    }
-  }
-
-  private static func defaultDeviceID() -> AudioDeviceID {
-    var addr = AudioObjectPropertyAddress(
-      mSelector: kAudioHardwarePropertyDefaultInputDevice,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    var id: AudioDeviceID = 0
-    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
-    AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &id)
-    return id
-  }
-
-  private static func hasInputStreams(_ id: AudioDeviceID) -> Bool {
-    var addr = AudioObjectPropertyAddress(
-      mSelector: kAudioDevicePropertyStreams,
-      mScope: kAudioDevicePropertyScopeInput,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    var size: UInt32 = 0
-    guard AudioObjectGetPropertyDataSize(id, &addr, 0, nil, &size) == noErr else { return false }
-    return size > 0
-  }
-
-  private static func name(of id: AudioDeviceID) -> String? {
-    var addr = AudioObjectPropertyAddress(
-      mSelector: kAudioObjectPropertyName,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    var name: CFString = "" as CFString
-    var size = UInt32(MemoryLayout<CFString>.size)
-    let status = withUnsafeMutablePointer(to: &name) { ptr -> OSStatus in
-      AudioObjectGetPropertyData(id, &addr, 0, nil, &size, ptr)
-    }
-    guard status == noErr else { return nil }
-    return name as String
+  static func find(matching query: String) -> AVCaptureDevice? {
+    all().first { $0.localizedName.localizedCaseInsensitiveContains(query) }
   }
 }
