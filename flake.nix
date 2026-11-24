@@ -18,12 +18,8 @@
         pkgs = nixpkgs.legacyPackages.${system};
       in
       {
-        devShells.default = pkgs.mkShell {
+        devShells.default = pkgs.mkShellNoCC {
           packages = [ pkgs.swift-format ];
-
-          shellHook = ''
-            unset SDKROOT DEVELOPER_DIR
-          '';
         };
       }
     );
